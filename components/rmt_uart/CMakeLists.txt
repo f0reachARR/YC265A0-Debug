@@ -1,0 +1,3 @@
+idf_component_register(SRCS "rmt_uart.c"
+    INCLUDE_DIRS "."
+    PRIV_REQUIRES esp_driver_rmt)

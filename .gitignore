@@ -56,3 +56,7 @@ cam/*
 .DS_Store
 
 production
+
+build/
+.envrc
+.cache/
