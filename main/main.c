@@ -10,9 +10,11 @@
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
 #include "driver/uart.h"
+#include "esp_err.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "portmacro.h"
 #include "rmt_uart.h"
 #include "tlv320aic32x4.h"
 
@@ -46,11 +48,16 @@ static const char * TAG = "main";
 #define UART_SDSP_NUM UART_NUM_1
 #define UART_KDSP_NUM UART_NUM_2
 #define UART_BUF_SIZE 1024
-#define RMT_UART_BUF_SIZE 500
+#define RMT_UART_BUF_SIZE 512
 #define MIDI_BAUD_RATE 31250
 
 // Audio configuration
 #define MCLK_FREQ 12000000
+
+rmt_uart_handle_t * tg1a_uart = NULL;
+rmt_uart_handle_t * tg1b_uart = NULL;
+rmt_uart_handle_t * tg2a_uart = NULL;
+rmt_uart_handle_t * tg2b_uart = NULL;
 
 static esp_err_t init_i2c_and_tlv320(
   i2c_master_bus_handle_t * i2c_bus, aic32x4_handle_t ** aic_handle)
@@ -175,16 +182,17 @@ static esp_err_t init_sound_source_midi_rmt_uart(void)
   // TG1A (TX/RX)
   rmt_uart_config_t tg1a_config = {
     .baud_rate = MIDI_BAUD_RATE,
-    .mode = RMT_UART_MODE_TX_RX,
-    .data_bits = RMT_UART_DATA_8_BITS,
-    .parity = RMT_UART_PARITY_DISABLE,
+    .data_bits = RMT_UART_DATA_BITS_8,
+    .parity = RMT_UART_PARITY_NONE,
     .stop_bits = RMT_UART_STOP_BITS_1,
-    .tx_io_num = TG1A_TX_PIN,
-    .rx_io_num = TG1_RX_PIN,
-    .buffer_size = RMT_UART_BUF_SIZE,
-  };
+    .tx_pin = TG1A_TX_PIN,
+    .rx_pin = TG1_RX_PIN,
+    .rx_buffer_size = RMT_UART_BUF_SIZE,
+    .tx_buffer_size = RMT_UART_BUF_SIZE,
+    .rmt_rx_symbols = 48,
+    .rmt_tx_symbols = 48};
 
-  ret = rmt_uart_init(RMT_UART_NUM_0, &tg1a_config);
+  ret = rmt_uart_init(&tg1a_config, &tg1a_uart);
   if (ret != ESP_OK) {
     ESP_LOGE(TAG, "Failed to initialize TG1A RMT UART: %s", esp_err_to_name(ret));
     return ret;
@@ -194,16 +202,16 @@ static esp_err_t init_sound_source_midi_rmt_uart(void)
   // TG1B (TX only)
   rmt_uart_config_t tg1b_config = {
     .baud_rate = MIDI_BAUD_RATE,
-    .mode = RMT_UART_MODE_TX_ONLY,
-    .data_bits = RMT_UART_DATA_8_BITS,
-    .parity = RMT_UART_PARITY_DISABLE,
+    .data_bits = RMT_UART_DATA_BITS_8,
+    .parity = RMT_UART_PARITY_NONE,
     .stop_bits = RMT_UART_STOP_BITS_1,
-    .tx_io_num = TG1B_TX_PIN,
-    .rx_io_num = GPIO_NUM_NC,
-    .buffer_size = RMT_UART_BUF_SIZE,
-  };
+    .tx_pin = TG1B_TX_PIN,
+    .rx_pin = GPIO_NUM_NC,
+    .tx_buffer_size = RMT_UART_BUF_SIZE,
+    .rmt_rx_symbols = 48,
+    .rmt_tx_symbols = 48};
 
-  ret = rmt_uart_init(RMT_UART_NUM_1, &tg1b_config);
+  ret = rmt_uart_init(&tg1b_config, &tg1b_uart);
   if (ret != ESP_OK) {
     ESP_LOGE(TAG, "Failed to initialize TG1B RMT UART: %s", esp_err_to_name(ret));
     return ret;
@@ -213,16 +221,17 @@ static esp_err_t init_sound_source_midi_rmt_uart(void)
   // TG2A (TX/RX)
   rmt_uart_config_t tg2a_config = {
     .baud_rate = MIDI_BAUD_RATE,
-    .mode = RMT_UART_MODE_TX_RX,
-    .data_bits = RMT_UART_DATA_8_BITS,
-    .parity = RMT_UART_PARITY_DISABLE,
+    .data_bits = RMT_UART_DATA_BITS_8,
+    .parity = RMT_UART_PARITY_NONE,
     .stop_bits = RMT_UART_STOP_BITS_1,
-    .tx_io_num = TG2A_TX_PIN,
-    .rx_io_num = TG2_RX_PIN,
-    .buffer_size = RMT_UART_BUF_SIZE,
-  };
+    .tx_pin = TG2A_TX_PIN,
+    .rx_pin = TG2_RX_PIN,
+    .rx_buffer_size = RMT_UART_BUF_SIZE,
+    .tx_buffer_size = RMT_UART_BUF_SIZE,
+    .rmt_rx_symbols = 48,
+    .rmt_tx_symbols = 48};
 
-  ret = rmt_uart_init(RMT_UART_NUM_2, &tg2a_config);
+  ret = rmt_uart_init(&tg2a_config, &tg2a_uart);
   if (ret != ESP_OK) {
     ESP_LOGE(TAG, "Failed to initialize TG2A RMT UART: %s", esp_err_to_name(ret));
     return ret;
@@ -232,16 +241,16 @@ static esp_err_t init_sound_source_midi_rmt_uart(void)
   // TG2B (TX only)
   rmt_uart_config_t tg2b_config = {
     .baud_rate = MIDI_BAUD_RATE,
-    .mode = RMT_UART_MODE_TX_ONLY,
-    .data_bits = RMT_UART_DATA_8_BITS,
-    .parity = RMT_UART_PARITY_DISABLE,
+    .data_bits = RMT_UART_DATA_BITS_8,
+    .parity = RMT_UART_PARITY_NONE,
     .stop_bits = RMT_UART_STOP_BITS_1,
-    .tx_io_num = TG2B_TX_PIN,
-    .rx_io_num = GPIO_NUM_NC,
-    .buffer_size = RMT_UART_BUF_SIZE,
-  };
+    .tx_pin = TG2B_TX_PIN,
+    .rx_pin = GPIO_NUM_NC,
+    .tx_buffer_size = RMT_UART_BUF_SIZE,
+    .rmt_rx_symbols = 48,
+    .rmt_tx_symbols = 48};
 
-  ret = rmt_uart_init(RMT_UART_NUM_3, &tg2b_config);
+  ret = rmt_uart_init(&tg2b_config, &tg2b_uart);
   if (ret != ESP_OK) {
     ESP_LOGE(TAG, "Failed to initialize TG2B RMT UART: %s", esp_err_to_name(ret));
     return ret;
@@ -258,6 +267,18 @@ void restart()
   vTaskDelay(pdMS_TO_TICKS(1000));
   ESP_LOGI(TAG, "Restarting system...");
   esp_restart();
+}
+
+void rmt_rx_thread()
+{
+  while (1) {
+    vTaskDelay(pdMS_TO_TICKS(1));
+    esp_err_t err = rmt_uart_process_rx(tg1a_uart);
+    if (err != ESP_OK) {
+      ESP_LOGE(TAG, "Error processing TG1A RX: %s", esp_err_to_name(err));
+    }
+    rmt_uart_process_rx(tg2a_uart);
+  }
 }
 
 void app_main(void)
@@ -290,19 +311,31 @@ void app_main(void)
 
   ESP_LOGI(TAG, "All peripherals initialized successfully");
 
-  unsigned char midi_msg[] = {0xF0, 0x43, 0x30, 0x31, 0x03, 0x00, 0x00,
-                              0x00, 0x00, 0x10, 0x10, 0x00, 0xF7};
-  // Test: Send a MIDI SysEx message to TG1A
-  int bytes_written = rmt_uart_write_bytes(RMT_UART_NUM_0, midi_msg, sizeof(midi_msg));
-  if (bytes_written < 0) {
-    ESP_LOGE(TAG, "Failed to send MIDI message to TG1A");
-  } else {
-    ESP_LOGI(TAG, "Sent %d bytes MIDI message to TG1A", bytes_written);
-  }
+  // Create RMT RX processing task
+  xTaskCreatePinnedToCore(
+    (TaskFunction_t)rmt_rx_thread, "rmt_rx_thread", 4096, NULL, tskIDLE_PRIORITY + 1, NULL,
+    tskNO_AFFINITY);
 
   // Main loop
   while (1) {
-    ESP_LOGI(TAG, "Running main loop...");
+    unsigned char midi_msg[] = {0xF0, 0x43, 0x30, 0x31, 0x03, 0x00, 0x00,
+                                0x00, 0x00, 0x10, 0x10, 0x00, 0xF7};
+    // Test: Send a MIDI SysEx message to TG1A
+    int bytes_written = rmt_uart_write_array(tg1a_uart, midi_msg, sizeof(midi_msg));
+    if (bytes_written < 0) {
+      ESP_LOGE(TAG, "Failed to send MIDI message to TG1A");
+    } else {
+      ESP_LOGI(TAG, "Sent %d bytes MIDI message to TG1A", bytes_written);
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    uint8_t byte;
+    // Example: Read a byte from TG1A
+    while (rmt_uart_read_byte(tg1a_uart, &byte)) {
+      ESP_LOGI(TAG, "Received byte from TG1A: 0x%02X", byte);
+    }
+
     vTaskDelay(pdMS_TO_TICKS(1000));
   }
 }

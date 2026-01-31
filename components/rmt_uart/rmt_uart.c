@@ -1,165 +1,469 @@
+/**
+ * @file rmt_uart.c
+ * @brief RMT-based software UART implementation for ESP32 (ESP-IDF v6)
+ */
+
 #include "rmt_uart.h"
 
+#include <driver/gpio.h>
+#include <esp_attr.h>
+#include <esp_log.h>
 #include <stdlib.h>
 #include <string.h>
 
-#include "driver/gpio.h"
-#include "driver/rmt_rx.h"
-#include "driver/rmt_tx.h"
 #include "esp_check.h"
-#include "esp_log.h"
-#include "freertos/queue.h"
 
-static const char * TAG = "rmt-uart";
+static const char * TAG = "rmt_uart";
 
-#define UART_TX_BUFFER_SIZE 128
-#define UART_RX_BUFFER_SIZE 128
+#define CLOCK_HZ (RMT_UART_CLK_FREQ / RMT_UART_CLK_DIV)
 
-#ifdef USE_ESP32_VARIANT_ESP32H2
-static const uint32_t RMT_CLK_FREQ = 32000000;
-static const uint8_t RMT_CLK_DIV = 1;
-#else
-static const uint32_t RMT_CLK_FREQ = 80000000;
-static const uint32_t RMT_CLK_DIV = 1;
-#endif
-#define CLOCK_HZ (RMT_CLK_FREQ / RMT_CLK_DIV)
+// Forward declarations
+static void rmt_uart_load_settings(rmt_uart_handle_t * handle);
+static esp_err_t rmt_uart_process_tx_queue(rmt_uart_handle_t * handle);
+static void rmt_uart_put_rx_byte(rmt_uart_handle_t * handle, uint8_t byte);
+static void rmt_uart_decode_rx_data(
+  rmt_uart_handle_t * handle, const rmt_symbol_word_t * symbols, int count);
 
-typedef struct
+/**
+ * @brief RMT RX callback (called from ISR context)
+ */
+static bool IRAM_ATTR
+rmt_rx_callback(rmt_channel_handle_t channel, const rmt_rx_done_event_data_t * event, void * arg)
 {
-  rmt_rx_done_event_data_t * received_symbols;
-  size_t num_symbols;
-} rmt_rx_event_t;
-
-typedef struct
-{
-  rmt_channel_handle_t channel;
-  rmt_encoder_handle_t encoder;
-  rmt_symbol_word_t * symbols;
-  uint32_t baud_rate_timing_array[10];
-  uint8_t * tx_buffer;
-  volatile size_t tx_head;
-  volatile size_t tx_tail;
-  size_t rmt_tx_symbols;
-} rmt_uart_context_tx_t;
-
-typedef struct
-{
-  rmt_channel_handle_t channel;
-  rmt_receive_config_t receive_config;
-  rmt_symbol_word_t * symbols;
-  uint8_t * rx_buffer;
-  volatile size_t rx_head;
-  volatile size_t rx_tail;
-  size_t rmt_rx_symbols;
-  QueueHandle_t queue;
-
-  // Ring buffer for events
-  uint8_t * event_buffer;
-  volatile size_t event_buffer_read;
-  volatile size_t event_buffer_write;
-  size_t event_buffer_size;
-  size_t receive_size;
-  volatile bool overflow;
-  esp_err_t error;
-} rmt_uart_context_rx_t;
-
-typedef struct
-{
-  rmt_uart_config_t config;
-  rmt_uart_context_tx_t tx_ctx;
-  rmt_uart_context_rx_t rx_ctx;
-  bool configured;
-  uint8_t data_bits;
-  uint8_t stop_bits;
-} rmt_uart_context_t;
-
-static rmt_uart_context_t rmt_uart_contexts[RMT_UART_NUM_MAX] = {0};
-
-static void load_baud_rate_settings(rmt_uart_context_t * ctx)
-{
-  // Generate baud rate timing array
-  uint32_t base_timing = CLOCK_HZ / ctx->config.baud_rate;
-  uint32_t rest = (CLOCK_HZ % ctx->config.baud_rate) / (ctx->config.baud_rate / 10);
-
-  for (int i = 0; i < 10; i++) {
-    ctx->tx_ctx.baud_rate_timing_array[i] = base_timing + ((i < rest) ? 1 : 0);
-  }
-
-  if (ctx->stop_bits == 2) {
-    ctx->tx_ctx.baud_rate_timing_array[9] = ctx->tx_ctx.baud_rate_timing_array[9] * 2;
-  }
-}
-
-static bool IRAM_ATTR rmt_rx_done_callback(
-  rmt_channel_handle_t channel, const rmt_rx_done_event_data_t * edata, void * user_data)
-{
-  BaseType_t higher_prio_woken = pdFALSE;
-  rmt_uart_context_rx_t * rx_ctx = (rmt_uart_context_rx_t *)user_data;
-
-  // Store event in ring buffer
-  uint32_t event_size = sizeof(size_t) + sizeof(rmt_symbol_word_t *);
+  rmt_uart_handle_t * handle = (rmt_uart_handle_t *)arg;
+  rmt_uart_rx_store_t * store = &handle->rx_store;
+  rmt_rx_done_event_data_t * event_buffer =
+    (rmt_rx_done_event_data_t *)(store->buffer + store->buffer_write);
+  uint32_t event_size = sizeof(rmt_rx_done_event_data_t);
   uint32_t next_write =
-    rx_ctx->event_buffer_write + event_size + edata->num_symbols * sizeof(rmt_symbol_word_t);
+    store->buffer_write + event_size + event->num_symbols * sizeof(rmt_symbol_word_t);
 
-  if (next_write + event_size + rx_ctx->receive_size > rx_ctx->event_buffer_size) {
+  // Handle buffer wraparound
+  if (next_write + event_size + store->receive_size > store->buffer_size) {
     next_write = 0;
   }
 
-  if (
-    (rx_ctx->event_buffer_read > rx_ctx->event_buffer_write &&
-     next_write >= rx_ctx->event_buffer_read) ||
-    (rx_ctx->event_buffer_read <= rx_ctx->event_buffer_write &&
-     (next_write >= rx_ctx->event_buffer_read + rx_ctx->event_buffer_size))) {
-    rx_ctx->overflow = true;
-    return false;
+  // Check for buffer overflow
+  if (store->buffer_read - next_write < event_size + store->receive_size) {
+    next_write = store->buffer_write;
+    store->overflow = true;
   }
 
+  // Start next receive operation
+  store->error = rmt_receive(
+    channel, (uint8_t *)store->buffer + next_write + event_size, store->receive_size,
+    &store->config);
+
   // Copy event data
-  uint8_t * event_ptr = rx_ctx->event_buffer + rx_ctx->event_buffer_write;
-  memcpy(event_ptr, &edata->num_symbols, sizeof(size_t));
-  memcpy(
-    event_ptr + sizeof(size_t), edata->received_symbols,
-    edata->num_symbols * sizeof(rmt_symbol_word_t));
+  event_buffer->num_symbols = event->num_symbols;
+  event_buffer->received_symbols = event->received_symbols;
+  store->buffer_write = next_write;
 
-  // Restart receive
-  rx_ctx->error = rmt_receive(
-    channel, (uint8_t *)rx_ctx->event_buffer + next_write + event_size, rx_ctx->receive_size,
-    &rx_ctx->receive_config);
-
-  rx_ctx->event_buffer_write = next_write;
-
-  return higher_prio_woken == pdTRUE;
+  return false;
 }
 
-static void decode_rmt_rx_data(
-  rmt_uart_context_t * ctx, const rmt_symbol_word_t * symbols, size_t count)
+/**
+ * @brief Get default configuration
+ */
+rmt_uart_config_t rmt_uart_get_default_config(uint8_t tx_pin, uint8_t rx_pin)
 {
-  rmt_uart_context_rx_t * rx_ctx = &ctx->rx_ctx;
-  uint32_t min_time_bit = ctx->tx_ctx.baud_rate_timing_array[0] * 9 / 10;
-  uint16_t data_bytes_mask = (1 << ctx->data_bits) - 1;
+  rmt_uart_config_t config = {
+    .tx_pin = tx_pin,
+    .rx_pin = rx_pin,
+    .baud_rate = RMT_UART_DEFAULT_BAUD_RATE,
+    .parity = RMT_UART_PARITY_NONE,
+    .stop_bits = RMT_UART_STOP_BITS_1,
+    .data_bits = RMT_UART_DATA_BITS_8,
+    .tx_buffer_size = RMT_UART_TX_BUFFER_SIZE,
+    .rx_buffer_size = RMT_UART_RX_BUFFER_SIZE,
+    .rmt_tx_symbols = 64,
+    .rmt_rx_symbols = 64};
+  return config;
+}
+
+/**
+ * @brief Load baud rate timing settings
+ */
+static void rmt_uart_load_settings(rmt_uart_handle_t * handle)
+{
+  // Generate baud rate timing array
+  uint32_t base_timing = CLOCK_HZ / handle->config.baud_rate;
+  uint32_t rest = (CLOCK_HZ % handle->config.baud_rate) / (handle->config.baud_rate / 10);
+
+  for (int i = 0; i < 10; i++) {
+    handle->baud_rate_timing_array[i] = base_timing + ((i < rest) ? 1 : 0);
+  }
+
+  // Adjust stop bit timing for 2 stop bits
+  if (handle->config.stop_bits == RMT_UART_STOP_BITS_2) {
+    handle->baud_rate_timing_array[9] = handle->baud_rate_timing_array[9] * 2;
+  }
+}
+
+/**
+ * @brief Initialize RMT UART
+ */
+esp_err_t rmt_uart_init(const rmt_uart_config_t * config, rmt_uart_handle_t ** handle)
+{
+  if (!config || !handle) {
+    return ESP_ERR_INVALID_ARG;
+  }
+
+  esp_err_t ret;
+
+  // Allocate handle
+  *handle = (rmt_uart_handle_t *)calloc(1, sizeof(rmt_uart_handle_t));
+  ESP_RETURN_ON_FALSE(*handle, ESP_ERR_NO_MEM, TAG, "Failed to allocate RMT UART handle");
+
+  rmt_uart_handle_t * h = *handle;
+  memcpy(&h->config, config, sizeof(rmt_uart_config_t));
+
+  ESP_LOGI(
+    TAG, "Initializing RMT UART: TX=%d, RX=%d, Baud=%lu", config->tx_pin, config->rx_pin,
+    config->baud_rate);
+
+  if (config->tx_pin != GPIO_NUM_NC) {
+    ESP_RETURN_ON_FALSE(
+      config->tx_buffer_size > 0, ESP_ERR_INVALID_ARG, TAG, "Invalid TX buffer size");
+    ESP_RETURN_ON_FALSE(
+      config->rmt_tx_symbols > 0, ESP_ERR_INVALID_ARG, TAG, "Invalid RMT TX symbols");
+
+    // Allocate TX buffer
+    h->tx_buffer = (uint8_t *)calloc(config->tx_buffer_size, sizeof(uint8_t));
+    if (!h->tx_buffer) {
+      ESP_LOGE(TAG, "Failed to allocate TX buffer");
+      rmt_uart_deinit(h);
+      return ESP_ERR_NO_MEM;
+    }
+
+    // Allocate RMT TX buffer (10 bits per byte + 1 for reset)
+    h->rmt_tx_buf =
+      (rmt_symbol_word_t *)calloc(config->tx_buffer_size * 10 + 1, sizeof(rmt_symbol_word_t));
+    if (!h->rmt_tx_buf) {
+      ESP_LOGE(TAG, "Failed to allocate RMT TX buffer");
+      rmt_uart_deinit(h);
+      return ESP_ERR_NO_MEM;
+    }
+
+    // Configure TX channel
+    rmt_tx_channel_config_t tx_channel = {
+      .clk_src = RMT_CLK_SRC_DEFAULT,
+      .resolution_hz = RMT_UART_CLK_FREQ / RMT_UART_CLK_DIV,
+      .gpio_num = config->tx_pin,
+      .mem_block_symbols = config->rmt_tx_symbols,
+      .trans_queue_depth = 1,
+      .flags =
+        {// .io_loop_back = 0,
+         // .io_od_mode = 0,
+         .invert_out = 0,
+         .with_dma = 0},
+      .intr_priority = 0};
+
+    ret = rmt_new_tx_channel(&tx_channel, &h->tx_channel);
+    if (ret != ESP_OK) {
+      ESP_LOGE(TAG, "Failed to create TX channel: %s", esp_err_to_name(ret));
+      rmt_uart_deinit(h);
+      return ret;
+    }
+
+    // Create encoder
+    rmt_copy_encoder_config_t encoder = {};
+    ret = rmt_new_copy_encoder(&encoder, &h->encoder);
+    if (ret != ESP_OK) {
+      ESP_LOGE(TAG, "Failed to create encoder: %s", esp_err_to_name(ret));
+      rmt_uart_deinit(h);
+      return ret;
+    }
+
+    // Enable TX channel
+    ret = rmt_enable(h->tx_channel);
+    if (ret != ESP_OK) {
+      ESP_LOGE(TAG, "Failed to enable TX channel: %s", esp_err_to_name(ret));
+      rmt_uart_deinit(h);
+      return ret;
+    }
+
+    // Send initial start bit for correct end-of-transmission level
+    rmt_symbol_word_t * symbols = h->rmt_tx_buf;
+    symbols[0].val = 0;
+    symbols[0].duration0 = 1;
+    symbols[0].level0 = 1;
+    symbols[0].duration1 = 1;
+    symbols[0].level1 = 1;
+
+    rmt_transmit_config_t tx_config = {.loop_count = 0, .flags = {.eot_level = 1}};
+
+    ret = rmt_transmit(h->tx_channel, h->encoder, symbols, sizeof(rmt_symbol_word_t), &tx_config);
+    if (ret != ESP_OK) {
+      ESP_LOGE(TAG, "Initial TX failed: %s", esp_err_to_name(ret));
+      rmt_uart_deinit(h);
+      return ret;
+    }
+  }
+
+  if (config->rx_pin != GPIO_NUM_NC) {
+    ESP_RETURN_ON_FALSE(
+      config->rx_buffer_size > 0, ESP_ERR_INVALID_ARG, TAG, "Invalid RX buffer size");
+    ESP_RETURN_ON_FALSE(
+      config->rmt_rx_symbols > 0, ESP_ERR_INVALID_ARG, TAG, "Invalid RMT RX symbols");
+
+    // Allocate RX buffer
+    h->rx_buffer = (uint8_t *)calloc(config->rx_buffer_size, sizeof(uint8_t));
+    if (!h->rx_buffer) {
+      ESP_LOGE(TAG, "Failed to allocate RX buffer");
+      rmt_uart_deinit(h);
+      return ESP_ERR_NO_MEM;
+    }
+
+    // Configure RX channel
+    rmt_rx_channel_config_t rx_channel = {
+      .clk_src = RMT_CLK_SRC_DEFAULT,
+      .resolution_hz = RMT_UART_CLK_FREQ / RMT_UART_CLK_DIV,
+      .mem_block_symbols = config->rmt_rx_symbols,
+      .gpio_num = config->rx_pin,
+      .intr_priority = 1,
+      .flags = {.invert_in = 0, .with_dma = 0}};
+
+    ret = rmt_new_rx_channel(&rx_channel, &h->rx_channel);
+    if (ret != ESP_OK) {
+      ESP_LOGE(TAG, "Failed to create RX channel: %s", esp_err_to_name(ret));
+      rmt_uart_deinit(h);
+      return ret;
+    }
+
+    // Enable pullup on RX pin
+    gpio_pullup_en((gpio_num_t)config->rx_pin);
+
+    // Enable RX channel
+    ret = rmt_enable(h->rx_channel);
+    if (ret != ESP_OK) {
+      ESP_LOGE(TAG, "Failed to enable RX channel: %s", esp_err_to_name(ret));
+      rmt_uart_deinit(h);
+      return ret;
+    }
+
+    // Register RX callback
+    rmt_rx_event_callbacks_t callbacks = {.on_recv_done = rmt_rx_callback};
+
+    ret = rmt_rx_register_event_callbacks(h->rx_channel, &callbacks, h);
+    if (ret != ESP_OK) {
+      ESP_LOGE(TAG, "Failed to register RX callbacks: %s", esp_err_to_name(ret));
+      rmt_uart_deinit(h);
+      return ret;
+    }
+
+    // Configure RX store
+    uint32_t event_size = sizeof(rmt_rx_done_event_data_t);
+    uint32_t max_filter_ns = 255u * 1000 / (RMT_UART_CLK_FREQ / 1000000);
+    uint32_t max_idle_ns = 65535u * 1000;
+
+    h->rx_store.config.signal_range_min_ns = (9000000000u / config->baud_rate < max_filter_ns)
+                                               ? 9000000000u / config->baud_rate
+                                               : max_filter_ns;
+    h->rx_store.config.signal_range_max_ns = (1000000000u / (config->baud_rate / 10) < max_idle_ns)
+                                               ? 1000000000u / (config->baud_rate / 10)
+                                               : max_idle_ns;
+
+    h->rx_store.receive_size = config->rmt_rx_symbols * sizeof(rmt_symbol_word_t);
+    h->rx_store.buffer_size = (event_size + h->rx_store.receive_size) * 8;
+    h->rx_store.buffer = (uint8_t *)calloc(h->rx_store.buffer_size, sizeof(uint8_t));
+
+    if (!h->rx_store.buffer) {
+      ESP_LOGE(TAG, "Failed to allocate RX store buffer");
+      rmt_uart_deinit(h);
+      return ESP_ERR_NO_MEM;
+    }
+
+    // Start initial receive
+    ret = rmt_receive(
+      h->rx_channel, (uint8_t *)h->rx_store.buffer + event_size, h->rx_store.receive_size,
+      &h->rx_store.config);
+    if (ret != ESP_OK) {
+      ESP_LOGE(TAG, "Failed to start receive: %s", esp_err_to_name(ret));
+      rmt_uart_deinit(h);
+      return ret;
+    }
+  }
+
+  // Load baud rate settings
+  rmt_uart_load_settings(h);
+
+  ESP_LOGI(TAG, "RMT UART initialized successfully");
+  return ESP_OK;
+}
+
+/**
+ * @brief Deinitialize RMT UART
+ */
+esp_err_t rmt_uart_deinit(rmt_uart_handle_t * handle)
+{
+  if (!handle) {
+    return ESP_ERR_INVALID_ARG;
+  }
+
+  if (handle->tx_channel) {
+    rmt_disable(handle->tx_channel);
+    rmt_del_channel(handle->tx_channel);
+  }
+
+  if (handle->rx_channel) {
+    rmt_disable(handle->rx_channel);
+    rmt_del_channel(handle->rx_channel);
+  }
+
+  if (handle->encoder) {
+    rmt_del_encoder(handle->encoder);
+  }
+
+  if (handle->rmt_tx_buf) {
+    free(handle->rmt_tx_buf);
+  }
+
+  if (handle->tx_buffer) {
+    free(handle->tx_buffer);
+  }
+
+  if (handle->rx_buffer) {
+    free(handle->rx_buffer);
+  }
+
+  if (handle->rx_store.buffer) {
+    free((void *)handle->rx_store.buffer);
+  }
+
+  free(handle);
+
+  ESP_LOGI(TAG, "RMT UART deinitialized");
+  return ESP_OK;
+}
+
+/**
+ * @brief Process TX queue
+ */
+static esp_err_t rmt_uart_process_tx_queue(rmt_uart_handle_t * handle)
+{
+  if (handle->tx_head == handle->tx_tail) {
+    return ESP_OK;
+  }
+
+  int length = (handle->tx_tail - handle->tx_head + handle->config.tx_buffer_size) %
+               handle->config.tx_buffer_size;
+
+  if (!handle->rmt_tx_buf) {
+    ESP_LOGE(TAG, "RMT TX buffer is null");
+    return ESP_ERR_INVALID_STATE;
+  }
+
+  uint8_t rmt_bits_per_byte = 1 +  // start bit
+                              handle->config.data_bits +
+                              (handle->config.parity != RMT_UART_PARITY_NONE ? 1 : 0) +
+                              1;  // stop bit
+
+  // Limit length based on available RMT symbols
+  if (handle->config.rmt_tx_symbols <= (length * rmt_bits_per_byte) / 2) {
+    length = (handle->config.rmt_tx_symbols / rmt_bits_per_byte) * 2;
+  }
+
+  rmt_symbol_half_word_t * half_symbols = (rmt_symbol_half_word_t *)handle->rmt_tx_buf;
+
+  for (int j = 0; j < length; j++) {
+    uint8_t byte = handle->tx_buffer[(handle->tx_head + j) % handle->config.tx_buffer_size];
+    bool parity_bit = (handle->config.parity != RMT_UART_PARITY_NONE) ? __builtin_parity(byte) : 0;
+
+    // Start bit
+    half_symbols[j * rmt_bits_per_byte].duration0 = handle->baud_rate_timing_array[0];
+    half_symbols[j * rmt_bits_per_byte].level0 = 0;
+
+    // Data bits
+    for (int i = 0; i < handle->config.data_bits; i++) {
+      half_symbols[j * rmt_bits_per_byte + i + 1].duration0 = handle->baud_rate_timing_array[i + 1];
+      half_symbols[j * rmt_bits_per_byte + i + 1].level0 = (byte >> i) & 1;
+    }
+
+    // Parity bit
+    if (handle->config.parity != RMT_UART_PARITY_NONE) {
+      half_symbols[j * rmt_bits_per_byte + handle->config.data_bits + 1].duration0 =
+        handle->baud_rate_timing_array[9];
+      half_symbols[j * rmt_bits_per_byte + handle->config.data_bits + 1].level0 =
+        (handle->config.parity == RMT_UART_PARITY_EVEN) ? (parity_bit & 1) : ((parity_bit ^ 1) & 1);
+    }
+
+    // Stop bit
+    half_symbols[j * rmt_bits_per_byte + rmt_bits_per_byte - 1].duration0 =
+      handle->config.stop_bits * handle->baud_rate_timing_array[9];
+    half_symbols[j * rmt_bits_per_byte + rmt_bits_per_byte - 1].level0 = 1;
+  }
+
+  uint8_t rmt_symbols_to_send = (length * rmt_bits_per_byte) / 2;
+  if ((length * rmt_bits_per_byte) % 2 != 0) {
+    half_symbols[length * rmt_bits_per_byte].duration0 = 1;
+    half_symbols[length * rmt_bits_per_byte].level0 = 1;
+    rmt_symbols_to_send++;
+  }
+
+  rmt_transmit_config_t config = {.loop_count = 0, .flags = {.eot_level = 1}};
+
+  esp_err_t ret = rmt_transmit(
+    handle->tx_channel, handle->encoder, half_symbols,
+    rmt_symbols_to_send * sizeof(rmt_symbol_word_t), &config);
+
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "RMT TX error: %s", esp_err_to_name(ret));
+    return ret;
+  }
+
+  handle->tx_head = (handle->tx_head + length) % handle->config.tx_buffer_size;
+
+  if (handle->tx_head != handle->tx_tail) {
+    // More data to send
+    return rmt_uart_process_tx_queue(handle);
+  }
+  return ESP_OK;
+}
+
+/**
+ * @brief Put received byte into RX buffer
+ */
+static void rmt_uart_put_rx_byte(rmt_uart_handle_t * handle, uint8_t byte)
+{
+  handle->rx_buffer[handle->rx_tail] = byte;
+  handle->rx_tail = (handle->rx_tail + 1) % handle->config.rx_buffer_size;
+}
+
+/**
+ * @brief Decode RMT RX data
+ */
+static void rmt_uart_decode_rx_data(
+  rmt_uart_handle_t * handle, const rmt_symbol_word_t * symbols, int count)
+{
+  uint32_t min_time_bit = handle->baud_rate_timing_array[0] * 9 / 10;
+  uint16_t data_bytes_mask = (1 << handle->config.data_bits) - 1;
   uint16_t received_byte = 0;
   uint8_t received_bits = 0;
   uint32_t total_received_bits = 0;
-
-  // Convert to half symbols for easier processing
   rmt_symbol_half_word_t * half_symbols = (rmt_symbol_half_word_t *)symbols;
   uint32_t count_half = count * 2;
 
   for (int i = 0; i < count_half; i++) {
-    // Looking for start bit
-    if (total_received_bits == 0) {
-      if (half_symbols[i].level0 != 0 || half_symbols[i].duration0 < min_time_bit) {
-        continue;  // Not a valid start bit
-      }
+    // Look for start bit
+    if (total_received_bits == 0 && (half_symbols[i].level0 != 0)) {
+      continue;
+    }
+
+    if (total_received_bits == 0 && (half_symbols[i].duration0 < min_time_bit)) {
+      continue;
     }
 
     if (half_symbols[i].duration0 == 0) {
       // Last bit before idle
-      received_bits = (1 + ctx->data_bits + ctx->stop_bits) - total_received_bits;
+      received_bits = (1 + handle->config.data_bits + handle->config.stop_bits +
+                       (handle->config.parity != RMT_UART_PARITY_NONE ? 1 : 0)) -
+                      total_received_bits;
     } else {
       received_bits = half_symbols[i].duration0 / min_time_bit;
     }
 
+    // Set bits to received_byte
     if (half_symbols[i].level0 == 1) {
       for (uint8_t j = 0; j < received_bits; j++) {
         received_byte |= (1 << (j + total_received_bits));
@@ -168,398 +472,209 @@ static void decode_rmt_rx_data(
 
     total_received_bits += received_bits;
 
-    if (total_received_bits >= (1 + ctx->data_bits + ctx->stop_bits)) {
-      // Extract data byte (skip start bit)
-      uint8_t data_byte = (uint8_t)((received_byte >> 1) & data_bytes_mask);
+    // Check if we received a complete byte
+    if (
+      total_received_bits >= (1 + handle->config.data_bits + handle->config.stop_bits +
+                              (handle->config.parity != RMT_UART_PARITY_NONE ? 1 : 0))) {
+      if (handle->config.parity != RMT_UART_PARITY_NONE) {
+        bool parity_bit = (received_byte >> (handle->config.data_bits + 1)) & 1;
+        uint8_t data_byte = (uint8_t)((received_byte >> 1) & data_bytes_mask);
+        bool calculated_parity = __builtin_parity(data_byte);
 
-      // Store in ring buffer
-      rx_ctx->rx_buffer[rx_ctx->rx_tail] = data_byte;
-      rx_ctx->rx_tail = (rx_ctx->rx_tail + 1) % UART_RX_BUFFER_SIZE;
+        if (
+          (handle->config.parity == RMT_UART_PARITY_EVEN && calculated_parity != parity_bit) ||
+          (handle->config.parity == RMT_UART_PARITY_ODD && calculated_parity == parity_bit)) {
+          ESP_LOGW(TAG, "Parity error detected");
+        } else {
+          rmt_uart_put_rx_byte(handle, data_byte);
+        }
+      } else {
+        rmt_uart_put_rx_byte(handle, (uint8_t)((received_byte >> 1) & data_bytes_mask));
+      }
 
-      // Reset for next byte
       received_byte = 0;
       total_received_bits = 0;
     }
   }
 }
 
-static void process_tx_queue(rmt_uart_context_t * ctx)
+/**
+ * @brief Write a single byte
+ */
+esp_err_t rmt_uart_write_byte(rmt_uart_handle_t * handle, uint8_t byte)
 {
-  rmt_uart_context_tx_t * tx_ctx = &ctx->tx_ctx;
-
-  if (tx_ctx->tx_head == tx_ctx->tx_tail) {
-    return;  // Nothing to send
+  if (!handle) {
+    return ESP_ERR_INVALID_ARG;
   }
 
-  // Calculate available data
-  size_t length = (tx_ctx->tx_tail - tx_ctx->tx_head + UART_TX_BUFFER_SIZE) % UART_TX_BUFFER_SIZE;
-
-  // Calculate bits per byte
-  uint8_t bits_per_byte = 1 + ctx->data_bits + ctx->stop_bits;
-
-  // Limit by RMT buffer size
-  size_t max_bytes = (tx_ctx->rmt_tx_symbols * 2) / bits_per_byte;
-  if (length > max_bytes) {
-    length = max_bytes;
-  }
-
-  // Build RMT symbols
-  rmt_symbol_half_word_t * half_symbols = (rmt_symbol_half_word_t *)tx_ctx->symbols;
-
-  for (size_t j = 0; j < length; j++) {
-    uint8_t byte = tx_ctx->tx_buffer[(tx_ctx->tx_head + j) % UART_TX_BUFFER_SIZE];
-    size_t offset = j * bits_per_byte;
-
-    // Start bit (0)
-    half_symbols[offset].duration0 = tx_ctx->baud_rate_timing_array[0];
-    half_symbols[offset].level0 = 0;
-
-    // Data bits
-    for (int i = 0; i < ctx->data_bits; i++) {
-      half_symbols[offset + i + 1].duration0 = tx_ctx->baud_rate_timing_array[i + 1];
-      half_symbols[offset + i + 1].level0 = (byte >> i) & 1;
-    }
-
-    // Stop bit(s) (1)
-    half_symbols[offset + ctx->data_bits + 1].duration0 =
-      ctx->stop_bits * tx_ctx->baud_rate_timing_array[9];
-    half_symbols[offset + ctx->data_bits + 1].level0 = 1;
-  }
-
-  // Calculate total symbols
-  size_t total_half_symbols = length * bits_per_byte;
-  size_t rmt_symbols_to_send = total_half_symbols / 2;
-
-  // If odd number of half symbols, add padding
-  if (total_half_symbols % 2 != 0) {
-    half_symbols[total_half_symbols].duration0 = 1;
-    half_symbols[total_half_symbols].level0 = 1;
-    rmt_symbols_to_send++;
-  }
-
-  // Transmit
-  rmt_transmit_config_t config = {
-    .loop_count = 0,
-    .flags =
-      {
-        .eot_level = 1,
-      },
-  };
-
-  esp_err_t err = rmt_transmit(
-    tx_ctx->channel, tx_ctx->encoder, tx_ctx->symbols,
-    rmt_symbols_to_send * sizeof(rmt_symbol_word_t), &config);
-
-  if (err != ESP_OK) {
-    ESP_LOGE(TAG, "RMT transmit failed: %d", err);
-    return;
-  }
-
-  // Update head
-  tx_ctx->tx_head = (tx_ctx->tx_head + length) % UART_TX_BUFFER_SIZE;
+  handle->tx_buffer[handle->tx_tail] = byte;
+  handle->tx_tail = (handle->tx_tail + 1) % handle->config.tx_buffer_size;
+  return rmt_uart_process_tx_queue(handle);
 }
 
-esp_err_t rmt_uart_init(rmt_uart_port_t uart_num, const rmt_uart_config_t * uart_config)
+/**
+ * @brief Write an array of bytes
+ */
+esp_err_t rmt_uart_write_array(rmt_uart_handle_t * handle, const uint8_t * buffer, size_t length)
 {
-  ESP_RETURN_ON_FALSE(uart_num < RMT_UART_NUM_MAX, ESP_ERR_INVALID_ARG, TAG, "Invalid uart_num");
-  ESP_RETURN_ON_FALSE(uart_config != NULL, ESP_ERR_INVALID_ARG, TAG, "uart_config is NULL");
-  ESP_RETURN_ON_FALSE(
-    uart_config->baud_rate >= 1200 && uart_config->baud_rate <= 460800, ESP_ERR_INVALID_ARG, TAG,
-    "Invalid baud_rate");
-
-  rmt_uart_context_t * ctx = &rmt_uart_contexts[uart_num];
-
-  // Copy config
-  memcpy(&ctx->config, uart_config, sizeof(rmt_uart_config_t));
-
-  // Set data bits and stop bits
-  ctx->data_bits = (uart_config->data_bits == RMT_UART_DATA_8_BITS) ? 8 : 9;
-  ctx->stop_bits = 1;
-
-  // Load baud rate settings
-  load_baud_rate_settings(ctx);
-
-  const uint32_t RMT_RES_HZ = CLOCK_HZ;
-  const uint32_t RMT_NS_PER_TICK = 1000000000UL / RMT_RES_HZ;
-
-  // Initialize TX
-  if (uart_config->mode == RMT_UART_MODE_TX_ONLY || uart_config->mode == RMT_UART_MODE_TX_RX) {
-    rmt_uart_context_tx_t * tx_ctx = &ctx->tx_ctx;
-
-    // Allocate TX buffer
-    tx_ctx->tx_buffer = calloc(UART_TX_BUFFER_SIZE, sizeof(uint8_t));
-    ESP_RETURN_ON_FALSE(tx_ctx->tx_buffer != NULL, ESP_ERR_NO_MEM, TAG, "TX buffer alloc failed");
-
-    tx_ctx->tx_head = 0;
-    tx_ctx->tx_tail = 0;
-
-    // Calculate RMT symbols needed
-    tx_ctx->rmt_tx_symbols = SOC_RMT_MEM_WORDS_PER_CHANNEL;
-
-    // Allocate RMT symbol buffer
-    tx_ctx->symbols = calloc(tx_ctx->rmt_tx_symbols, sizeof(rmt_symbol_word_t));
-    ESP_RETURN_ON_FALSE(tx_ctx->symbols != NULL, ESP_ERR_NO_MEM, TAG, "TX symbols alloc failed");
-
-    // Configure TX channel
-    rmt_tx_channel_config_t tx_chan_cfg = {
-      .gpio_num = uart_config->tx_io_num,
-      .clk_src = RMT_CLK_SRC_DEFAULT,
-      .resolution_hz = RMT_RES_HZ,
-      .mem_block_symbols = tx_ctx->rmt_tx_symbols,
-      .trans_queue_depth = 1,
-      .flags =
-        {
-          .invert_out = 0,
-        },
-    };
-
-    ESP_ERROR_CHECK(rmt_new_tx_channel(&tx_chan_cfg, &tx_ctx->channel));
-
-    // Create copy encoder
-    rmt_copy_encoder_config_t encoder_cfg = {};
-    ESP_ERROR_CHECK(rmt_new_copy_encoder(&encoder_cfg, &tx_ctx->encoder));
-
-    // Enable channel
-    ESP_ERROR_CHECK(rmt_enable(tx_ctx->channel));
-
-    // Send initial idle level
-    rmt_symbol_word_t idle_symbol = {
-      .duration0 = 1,
-      .level0 = 1,
-      .duration1 = 1,
-      .level1 = 1,
-    };
-
-    rmt_transmit_config_t idle_config = {
-      .loop_count = 0,
-      .flags.eot_level = 1,
-    };
-
-    ESP_ERROR_CHECK(rmt_transmit(
-      tx_ctx->channel, tx_ctx->encoder, &idle_symbol, sizeof(idle_symbol), &idle_config));
-    ESP_ERROR_CHECK(rmt_tx_wait_all_done(tx_ctx->channel, portMAX_DELAY));
+  if (!handle || !buffer) {
+    return ESP_ERR_INVALID_ARG;
   }
 
-  // Initialize RX
-  if (uart_config->mode == RMT_UART_MODE_RX_ONLY || uart_config->mode == RMT_UART_MODE_TX_RX) {
-    rmt_uart_context_rx_t * rx_ctx = &ctx->rx_ctx;
+  size_t available_space = handle->config.tx_buffer_size -
+                           ((handle->tx_tail - handle->tx_head + handle->config.tx_buffer_size) %
+                            handle->config.tx_buffer_size);
 
-    // Allocate RX buffer
-    rx_ctx->rx_buffer = calloc(UART_RX_BUFFER_SIZE, sizeof(uint8_t));
-    ESP_RETURN_ON_FALSE(rx_ctx->rx_buffer != NULL, ESP_ERR_NO_MEM, TAG, "RX buffer alloc failed");
-
-    rx_ctx->rx_head = 0;
-    rx_ctx->rx_tail = 0;
-
-    // Calculate RMT symbols needed
-    rx_ctx->rmt_rx_symbols = SOC_RMT_MEM_WORDS_PER_CHANNEL;
-
-    // Configure RX channel
-    rmt_rx_channel_config_t rx_chan_cfg = {
-      .gpio_num = uart_config->rx_io_num,
-      .clk_src = RMT_CLK_SRC_DEFAULT,
-      .resolution_hz = RMT_RES_HZ,
-      .mem_block_symbols = rx_ctx->rmt_rx_symbols,
-      .flags =
-        {
-          .invert_in = 0,
-        },
-    };
-
-    ESP_ERROR_CHECK(rmt_new_rx_channel(&rx_chan_cfg, &rx_ctx->channel));
-
-    // Enable pull-up on RX pin
-    gpio_pullup_en(uart_config->rx_io_num);
-
-    // Enable channel
-    ESP_ERROR_CHECK(rmt_enable(rx_ctx->channel));
-
-    // Configure receive settings
-    uint32_t max_filter_ns = 255u * 1000 / (RMT_CLK_FREQ / 1000000);
-    uint32_t max_idle_ns = 65535u * 1000;
-
-    rx_ctx->receive_config.signal_range_min_ns =
-      (9000000000u / uart_config->baud_rate < max_filter_ns) ? 9000000000u / uart_config->baud_rate
-                                                             : max_filter_ns;
-    rx_ctx->receive_config.signal_range_max_ns =
-      (1000000000u / (uart_config->baud_rate / 10) < max_idle_ns)
-        ? 1000000000u / (uart_config->baud_rate / 10)
-        : max_idle_ns;
-
-    // Allocate event buffer (ring buffer for received events)
-    uint32_t event_size = sizeof(size_t);
-    rx_ctx->receive_size = rx_ctx->rmt_rx_symbols * sizeof(rmt_symbol_word_t);
-    rx_ctx->event_buffer_size = (event_size + rx_ctx->receive_size) * 3;
-    rx_ctx->event_buffer = calloc(rx_ctx->event_buffer_size, sizeof(uint8_t));
-    ESP_RETURN_ON_FALSE(
-      rx_ctx->event_buffer != NULL, ESP_ERR_NO_MEM, TAG, "Event buffer alloc failed");
-
-    rx_ctx->event_buffer_read = 0;
-    rx_ctx->event_buffer_write = 0;
-    rx_ctx->overflow = false;
-    rx_ctx->error = ESP_OK;
-
-    // Register callback
-    rmt_rx_event_callbacks_t cbs = {
-      .on_recv_done = rmt_rx_done_callback,
-    };
-    ESP_ERROR_CHECK(rmt_rx_register_event_callbacks(rx_ctx->channel, &cbs, rx_ctx));
-
-    // Start receiving
-    ESP_ERROR_CHECK(rmt_receive(
-      rx_ctx->channel, rx_ctx->event_buffer + event_size, rx_ctx->receive_size,
-      &rx_ctx->receive_config));
-  }
-
-  ctx->configured = true;
-
-  ESP_LOGI(
-    TAG, "RMT UART %d initialized: TX=%d, RX=%d, baud=%d", uart_num, uart_config->tx_io_num,
-    uart_config->rx_io_num, uart_config->baud_rate);
-
-  return ESP_OK;
-}
-
-esp_err_t rmt_uart_write_bytes(rmt_uart_port_t uart_num, const uint8_t * data, size_t size)
-{
-  ESP_RETURN_ON_FALSE(uart_num < RMT_UART_NUM_MAX, ESP_ERR_INVALID_ARG, TAG, "Invalid uart_num");
-
-  rmt_uart_context_t * ctx = &rmt_uart_contexts[uart_num];
-  ESP_RETURN_ON_FALSE(ctx->configured, ESP_ERR_INVALID_STATE, TAG, "UART not configured");
-  ESP_RETURN_ON_FALSE(
-    ctx->config.mode != RMT_UART_MODE_RX_ONLY, ESP_ERR_INVALID_STATE, TAG, "UART is RX only");
-
-  rmt_uart_context_tx_t * tx_ctx = &ctx->tx_ctx;
-
-  // Check available space
-  size_t available =
-    UART_TX_BUFFER_SIZE -
-    ((tx_ctx->tx_tail - tx_ctx->tx_head + UART_TX_BUFFER_SIZE) % UART_TX_BUFFER_SIZE);
-
-  if (size > available - 1) {  // Keep one byte free to distinguish full from empty
-    ESP_LOGW(TAG, "TX buffer full");
+  if (length > available_space) {
+    ESP_LOGE(TAG, "Not enough space in TX buffer");
     return ESP_ERR_NO_MEM;
   }
 
-  // Copy data to ring buffer
-  for (size_t i = 0; i < size; i++) {
-    tx_ctx->tx_buffer[tx_ctx->tx_tail] = data[i];
-    tx_ctx->tx_tail = (tx_ctx->tx_tail + 1) % UART_TX_BUFFER_SIZE;
+  size_t first_chunk = (length < (handle->config.tx_buffer_size - handle->tx_tail))
+                         ? length
+                         : (handle->config.tx_buffer_size - handle->tx_tail);
+
+  memcpy(&handle->tx_buffer[handle->tx_tail], buffer, first_chunk);
+  memcpy(&handle->tx_buffer[0], buffer + first_chunk, length - first_chunk);
+
+  handle->tx_tail = (handle->tx_tail + length) % handle->config.tx_buffer_size;
+  return rmt_uart_process_tx_queue(handle);
+}
+
+/**
+ * @brief Read a single byte
+ */
+bool rmt_uart_read_byte(rmt_uart_handle_t * handle, uint8_t * byte)
+{
+  if (!handle || !byte) {
+    return false;
   }
 
-  // Process TX queue
-  process_tx_queue(ctx);
+  if (handle->rx_head == handle->rx_tail) {
+    return false;
+  }
+
+  *byte = handle->rx_buffer[handle->rx_head];
+  handle->rx_head = (handle->rx_head + 1) % handle->config.rx_buffer_size;
+  return true;
+}
+
+/**
+ * @brief Read multiple bytes
+ */
+bool rmt_uart_read_array(rmt_uart_handle_t * handle, uint8_t * buffer, size_t length)
+{
+  if (!handle || !buffer) {
+    return false;
+  }
+
+  for (size_t i = 0; i < length; i++) {
+    if (!rmt_uart_read_byte(handle, &buffer[i])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * @brief Peek at next byte
+ */
+bool rmt_uart_peek_byte(rmt_uart_handle_t * handle, uint8_t * byte)
+{
+  if (!handle || !byte) {
+    return false;
+  }
+
+  if (handle->rx_head == handle->rx_tail) {
+    return false;
+  }
+
+  *byte = handle->rx_buffer[handle->rx_head];
+  return true;
+}
+
+/**
+ * @brief Get number of available bytes
+ */
+int rmt_uart_available(rmt_uart_handle_t * handle)
+{
+  if (!handle) {
+    return 0;
+  }
+
+  return (handle->rx_tail - handle->rx_head + handle->config.rx_buffer_size) %
+         handle->config.rx_buffer_size;
+}
+
+/**
+ * @brief Flush TX buffer
+ */
+esp_err_t rmt_uart_flush(rmt_uart_handle_t * handle)
+{
+  if (!handle) {
+    return ESP_ERR_INVALID_ARG;
+  }
+
+  while (handle->tx_head != handle->tx_tail) {
+    esp_err_t ret = rmt_uart_process_tx_queue(handle);
+    if (ret != ESP_OK) {
+      return ret;
+    }
+  }
 
   return ESP_OK;
 }
 
-int rmt_uart_read_bytes(
-  rmt_uart_port_t uart_num, uint8_t * buf, size_t buf_size, TickType_t timeout)
+/**
+ * @brief Process RX data (call from main loop)
+ */
+esp_err_t rmt_uart_process_rx(rmt_uart_handle_t * handle)
 {
-  ESP_RETURN_ON_FALSE(uart_num < RMT_UART_NUM_MAX, -1, TAG, "Invalid uart_num");
+  if (!handle) {
+    return ESP_ERR_INVALID_ARG;
+  }
 
-  rmt_uart_context_t * ctx = &rmt_uart_contexts[uart_num];
-  ESP_RETURN_ON_FALSE(ctx->configured, -1, TAG, "UART not configured");
-  ESP_RETURN_ON_FALSE(ctx->config.mode != RMT_UART_MODE_TX_ONLY, -1, TAG, "UART is TX only");
+  if (handle->rx_store.error != ESP_OK) {
+    ESP_LOGE(TAG, "RX error: %s", esp_err_to_name(handle->rx_store.error));
+    return handle->rx_store.error;
+  }
 
-  rmt_uart_context_rx_t * rx_ctx = &ctx->rx_ctx;
+  if (handle->rx_store.overflow) {
+    ESP_LOGW(
+      TAG, "Buffer overflow: read=%lu write=%lu", handle->rx_store.buffer_read,
+      handle->rx_store.buffer_write);
+    handle->rx_store.overflow = false;
+  }
 
-  // Process any pending RX events
-  uint32_t event_size = sizeof(size_t);
-  while (rx_ctx->event_buffer_read != rx_ctx->event_buffer_write) {
-    uint8_t * event_ptr = rx_ctx->event_buffer + rx_ctx->event_buffer_read;
-    size_t num_symbols;
-    memcpy(&num_symbols, event_ptr, sizeof(size_t));
-
-    rmt_symbol_word_t * symbols = (rmt_symbol_word_t *)(event_ptr + sizeof(size_t));
-    decode_rmt_rx_data(ctx, symbols, num_symbols);
-
+  uint32_t buffer_write = handle->rx_store.buffer_write;
+  while (handle->rx_store.buffer_read != buffer_write) {
+    rmt_rx_done_event_data_t * event =
+      (rmt_rx_done_event_data_t *)(handle->rx_store.buffer + handle->rx_store.buffer_read);
+    uint32_t event_size = sizeof(rmt_rx_done_event_data_t);
     uint32_t next_read =
-      rx_ctx->event_buffer_read + event_size + num_symbols * sizeof(rmt_symbol_word_t);
-    if (next_read + event_size + rx_ctx->receive_size > rx_ctx->event_buffer_size) {
+      handle->rx_store.buffer_read + event_size + event->num_symbols * sizeof(rmt_symbol_word_t);
+
+    if (next_read + event_size + handle->rx_store.receive_size > handle->rx_store.buffer_size) {
       next_read = 0;
     }
-    rx_ctx->event_buffer_read = next_read;
+
+    rmt_uart_decode_rx_data(handle, event->received_symbols, event->num_symbols);
+    handle->rx_store.buffer_read = next_read;
   }
 
-  // Read from RX buffer
-  size_t bytes_read = 0;
-  TickType_t start_time = xTaskGetTickCount();
-
-  while (bytes_read < buf_size) {
-    if (rx_ctx->rx_head != rx_ctx->rx_tail) {
-      buf[bytes_read] = rx_ctx->rx_buffer[rx_ctx->rx_head];
-      rx_ctx->rx_head = (rx_ctx->rx_head + 1) % UART_RX_BUFFER_SIZE;
-      bytes_read++;
-    } else {
-      // Check timeout
-      if (timeout != portMAX_DELAY && (xTaskGetTickCount() - start_time) >= timeout) {
-        break;
-      }
-      vTaskDelay(1);
-    }
-  }
-
-  return bytes_read;
+  return ESP_OK;
 }
 
-esp_err_t rmt_uart_deinit(rmt_uart_port_t uart_num)
+/**
+ * @brief Set baud rate
+ */
+esp_err_t rmt_uart_set_baud_rate(rmt_uart_handle_t * handle, uint32_t baud_rate)
 {
-  ESP_RETURN_ON_FALSE(uart_num < RMT_UART_NUM_MAX, ESP_ERR_INVALID_ARG, TAG, "Invalid uart_num");
-
-  rmt_uart_context_t * ctx = &rmt_uart_contexts[uart_num];
-  ESP_RETURN_ON_FALSE(ctx->configured, ESP_ERR_INVALID_STATE, TAG, "UART not configured");
-
-  // Cleanup TX
-  if (ctx->config.mode != RMT_UART_MODE_RX_ONLY) {
-    rmt_uart_context_tx_t * tx_ctx = &ctx->tx_ctx;
-
-    if (tx_ctx->channel != NULL) {
-      rmt_disable(tx_ctx->channel);
-      rmt_del_channel(tx_ctx->channel);
-      tx_ctx->channel = NULL;
-    }
-
-    if (tx_ctx->encoder != NULL) {
-      rmt_del_encoder(tx_ctx->encoder);
-      tx_ctx->encoder = NULL;
-    }
-
-    if (tx_ctx->symbols != NULL) {
-      free(tx_ctx->symbols);
-      tx_ctx->symbols = NULL;
-    }
-
-    if (tx_ctx->tx_buffer != NULL) {
-      free(tx_ctx->tx_buffer);
-      tx_ctx->tx_buffer = NULL;
-    }
+  if (!handle) {
+    return ESP_ERR_INVALID_ARG;
   }
 
-  // Cleanup RX
-  if (ctx->config.mode != RMT_UART_MODE_TX_ONLY) {
-    rmt_uart_context_rx_t * rx_ctx = &ctx->rx_ctx;
-
-    if (rx_ctx->channel != NULL) {
-      rmt_disable(rx_ctx->channel);
-      rmt_del_channel(rx_ctx->channel);
-      rx_ctx->channel = NULL;
-    }
-
-    if (rx_ctx->event_buffer != NULL) {
-      free(rx_ctx->event_buffer);
-      rx_ctx->event_buffer = NULL;
-    }
-
-    if (rx_ctx->rx_buffer != NULL) {
-      free(rx_ctx->rx_buffer);
-      rx_ctx->rx_buffer = NULL;
-    }
-  }
-
-  ctx->configured = false;
-
-  ESP_LOGI(TAG, "RMT UART %d deinitialized", uart_num);
-
+  handle->config.baud_rate = baud_rate;
+  rmt_uart_load_settings(handle);
   return ESP_OK;
 }

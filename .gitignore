@@ -60,3 +60,4 @@ production
 build/
 .envrc
 .cache/
+_autosave*
