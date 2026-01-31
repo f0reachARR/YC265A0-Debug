@@ -43,10 +43,20 @@ rmt_rx_callback(rmt_channel_handle_t channel, const rmt_rx_done_event_data_t * e
   // Copy event data
   uint8_t * received_symbols_last =
     received_symbols + combined_event_data->num_symbols * sizeof(rmt_symbol_word_t);
-  memcpy(
-    received_symbols_last, event->received_symbols, event->num_symbols * sizeof(rmt_symbol_word_t));
-  combined_event_data->num_symbols += event->num_symbols;
-  combined_event_data->received_symbols = (rmt_symbol_word_t *)received_symbols;
+
+  if (
+    store->buffer_write + RMT_RX_DONE_EVENT_SIZE +
+      (combined_event_data->num_symbols + event->num_symbols) * sizeof(rmt_symbol_word_t) >
+    store->buffer_size) {
+    store->overflow = true;
+  } else {
+    memcpy(
+      received_symbols_last, event->received_symbols,
+      event->num_symbols * sizeof(rmt_symbol_word_t));
+    combined_event_data->num_symbols += event->num_symbols;
+    // backward compatibility
+    combined_event_data->received_symbols = (rmt_symbol_word_t *)received_symbols;
+  }
 
   if (event->flags.is_last) {
     uint32_t next_write = store->buffer_write + RMT_RX_DONE_EVENT_SIZE +

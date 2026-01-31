@@ -273,10 +273,7 @@ void rmt_rx_thread()
 {
   while (1) {
     vTaskDelay(pdMS_TO_TICKS(1));
-    esp_err_t err = rmt_uart_process_rx(tg1a_uart);
-    if (err != ESP_OK) {
-      ESP_LOGE(TAG, "Error processing TG1A RX: %s", esp_err_to_name(err));
-    }
+    rmt_uart_process_rx(tg1a_uart);
     rmt_uart_process_rx(tg2a_uart);
   }
 }
