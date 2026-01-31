@@ -8,14 +8,17 @@
 #include <driver/gpio.h>
 #include <esp_attr.h>
 #include <esp_log.h>
+#include <memory.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include "driver/rmt_types.h"
 #include "esp_check.h"
 
 static const char * TAG = "rmt_uart";
 
 #define CLOCK_HZ (RMT_UART_CLK_FREQ / RMT_UART_CLK_DIV)
+#define RMT_RX_DONE_EVENT_SIZE (sizeof(rmt_rx_done_event_data_t))
 
 // Forward declarations
 static void rmt_uart_load_settings(rmt_uart_handle_t * handle);
@@ -32,32 +35,43 @@ rmt_rx_callback(rmt_channel_handle_t channel, const rmt_rx_done_event_data_t * e
 {
   rmt_uart_handle_t * handle = (rmt_uart_handle_t *)arg;
   rmt_uart_rx_store_t * store = &handle->rx_store;
-  rmt_rx_done_event_data_t * event_buffer =
+  rmt_rx_done_event_data_t * combined_event_data =
     (rmt_rx_done_event_data_t *)(store->buffer + store->buffer_write);
-  uint32_t event_size = sizeof(rmt_rx_done_event_data_t);
-  uint32_t next_write =
-    store->buffer_write + event_size + event->num_symbols * sizeof(rmt_symbol_word_t);
-
-  // Handle buffer wraparound
-  if (next_write + event_size + store->receive_size > store->buffer_size) {
-    next_write = 0;
-  }
-
-  // Check for buffer overflow
-  if (store->buffer_read - next_write < event_size + store->receive_size) {
-    next_write = store->buffer_write;
-    store->overflow = true;
-  }
-
-  // Start next receive operation
-  store->error = rmt_receive(
-    channel, (uint8_t *)store->buffer + next_write + event_size, store->receive_size,
-    &store->config);
+  uint8_t * received_symbols =
+    (uint8_t *)(store->buffer + store->buffer_write + RMT_RX_DONE_EVENT_SIZE);
 
   // Copy event data
-  event_buffer->num_symbols = event->num_symbols;
-  event_buffer->received_symbols = event->received_symbols;
-  store->buffer_write = next_write;
+  uint8_t * received_symbols_last =
+    received_symbols + combined_event_data->num_symbols * sizeof(rmt_symbol_word_t);
+  memcpy(
+    received_symbols_last, event->received_symbols, event->num_symbols * sizeof(rmt_symbol_word_t));
+  combined_event_data->num_symbols += event->num_symbols;
+  combined_event_data->received_symbols = (rmt_symbol_word_t *)received_symbols;
+
+  if (event->flags.is_last) {
+    uint32_t next_write = store->buffer_write + RMT_RX_DONE_EVENT_SIZE +
+                          combined_event_data->num_symbols * sizeof(rmt_symbol_word_t);
+
+    // Handle buffer wraparound
+    if (next_write + RMT_RX_DONE_EVENT_SIZE + store->receive_size > store->buffer_size) {
+      next_write = 0;
+    }
+
+    // Check for buffer overflow
+    if (store->buffer_read - next_write < RMT_RX_DONE_EVENT_SIZE + store->receive_size) {
+      next_write = store->buffer_write;
+      store->overflow = true;
+    }
+    store->buffer_write = next_write;
+
+    rmt_rx_done_event_data_t * next_event_data =
+      (rmt_rx_done_event_data_t *)(store->buffer + store->buffer_write);
+    next_event_data->num_symbols = 0;
+
+    // Start next receive operation
+    store->error =
+      rmt_receive(channel, (uint8_t *)store->partial_buffer, store->receive_size, &store->config);
+  }
 
   return false;
 }
@@ -221,7 +235,7 @@ esp_err_t rmt_uart_init(const rmt_uart_config_t * config, rmt_uart_handle_t ** h
       .resolution_hz = RMT_UART_CLK_FREQ / RMT_UART_CLK_DIV,
       .mem_block_symbols = config->rmt_rx_symbols,
       .gpio_num = config->rx_pin,
-      .intr_priority = 1,
+      .intr_priority = 0,
       .flags = {.invert_in = 0, .with_dma = 0}};
 
     ret = rmt_new_rx_channel(&rx_channel, &h->rx_channel);
@@ -253,7 +267,6 @@ esp_err_t rmt_uart_init(const rmt_uart_config_t * config, rmt_uart_handle_t ** h
     }
 
     // Configure RX store
-    uint32_t event_size = sizeof(rmt_rx_done_event_data_t);
     uint32_t max_filter_ns = 255u * 1000 / (RMT_UART_CLK_FREQ / 1000000);
     uint32_t max_idle_ns = 65535u * 1000;
 
@@ -263,10 +276,12 @@ esp_err_t rmt_uart_init(const rmt_uart_config_t * config, rmt_uart_handle_t ** h
     h->rx_store.config.signal_range_max_ns = (1000000000u / (config->baud_rate / 10) < max_idle_ns)
                                                ? 1000000000u / (config->baud_rate / 10)
                                                : max_idle_ns;
+    h->rx_store.config.flags.en_partial_rx = 1;
 
     h->rx_store.receive_size = config->rmt_rx_symbols * sizeof(rmt_symbol_word_t);
-    h->rx_store.buffer_size = (event_size + h->rx_store.receive_size) * 8;
+    h->rx_store.buffer_size = (RMT_RX_DONE_EVENT_SIZE + h->rx_store.receive_size) * 8;
     h->rx_store.buffer = (uint8_t *)calloc(h->rx_store.buffer_size, sizeof(uint8_t));
+    h->rx_store.partial_buffer = (uint8_t *)calloc(h->rx_store.receive_size, sizeof(uint8_t));
 
     if (!h->rx_store.buffer) {
       ESP_LOGE(TAG, "Failed to allocate RX store buffer");
@@ -274,9 +289,15 @@ esp_err_t rmt_uart_init(const rmt_uart_config_t * config, rmt_uart_handle_t ** h
       return ESP_ERR_NO_MEM;
     }
 
+    if (!h->rx_store.partial_buffer) {
+      ESP_LOGE(TAG, "Failed to allocate RX store partial buffer");
+      rmt_uart_deinit(h);
+      return ESP_ERR_NO_MEM;
+    }
+
     // Start initial receive
     ret = rmt_receive(
-      h->rx_channel, (uint8_t *)h->rx_store.buffer + event_size, h->rx_store.receive_size,
+      h->rx_channel, (uint8_t *)h->rx_store.partial_buffer, h->rx_store.receive_size,
       &h->rx_store.config);
     if (ret != ESP_OK) {
       ESP_LOGE(TAG, "Failed to start receive: %s", esp_err_to_name(ret));
@@ -650,11 +671,12 @@ esp_err_t rmt_uart_process_rx(rmt_uart_handle_t * handle)
   while (handle->rx_store.buffer_read != buffer_write) {
     rmt_rx_done_event_data_t * event =
       (rmt_rx_done_event_data_t *)(handle->rx_store.buffer + handle->rx_store.buffer_read);
-    uint32_t event_size = sizeof(rmt_rx_done_event_data_t);
-    uint32_t next_read =
-      handle->rx_store.buffer_read + event_size + event->num_symbols * sizeof(rmt_symbol_word_t);
+    uint32_t next_read = handle->rx_store.buffer_read + RMT_RX_DONE_EVENT_SIZE +
+                         event->num_symbols * sizeof(rmt_symbol_word_t);
 
-    if (next_read + event_size + handle->rx_store.receive_size > handle->rx_store.buffer_size) {
+    if (
+      next_read + RMT_RX_DONE_EVENT_SIZE + handle->rx_store.receive_size >
+      handle->rx_store.buffer_size) {
       next_read = 0;
     }
 

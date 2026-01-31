@@ -73,6 +73,7 @@ typedef struct
 typedef struct
 {
   volatile uint8_t * buffer;
+  volatile uint8_t * partial_buffer;
   volatile uint32_t buffer_write;
   volatile uint32_t buffer_read;
   bool overflow;
