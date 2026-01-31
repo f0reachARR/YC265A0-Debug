@@ -1,5 +1,7 @@
 {
     "idf.pythonInstallPath": "/usr/bin/python3",
     "ROS2.distro": "jazzy",
-    "ansible.python.interpreterPath": "/bin/python3"
+    "ansible.python.interpreterPath": "/bin/python3",
+    "idf.flashType": "UART",
+    "idf.port": "/dev/ttyACM0"
 }

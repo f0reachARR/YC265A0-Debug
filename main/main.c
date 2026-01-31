@@ -4,50 +4,305 @@
  * SPDX-License-Identifier: CC0-1.0
  */
 
-#include <inttypes.h>
 #include <stdio.h>
+#include <string.h>
 
-#include "esp_chip_info.h"
-#include "esp_flash.h"
-#include "esp_system.h"
+#include "driver/gpio.h"
+#include "driver/i2c_master.h"
+#include "driver/uart.h"
+#include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "sdkconfig.h"
+#include "rmt_uart.h"
+#include "tlv320aic32x4.h"
+
+static const char * TAG = "main";
+
+// Pin definitions from pin_assign.md
+
+// MIDI (制御用)
+#define SDSP_TX_PIN GPIO_NUM_17
+#define SDSP_RX_PIN GPIO_NUM_18
+#define KDSP_TX_PIN GPIO_NUM_46
+#define KDSP_RX_PIN GPIO_NUM_9
+
+// MIDI (音源)
+#define TG1A_TX_PIN GPIO_NUM_3
+#define TG1B_TX_PIN GPIO_NUM_7
+#define TG1_RX_PIN GPIO_NUM_15
+#define TG2A_TX_PIN GPIO_NUM_16
+#define TG2B_TX_PIN GPIO_NUM_5
+#define TG2_RX_PIN GPIO_NUM_6
+
+// I2C (TLV320AIC32X4用)
+#define I2C_SCL_PIN GPIO_NUM_45
+#define I2C_SDA_PIN GPIO_NUM_48
+#define I2C_FREQ_HZ 400000
+
+// GPIO (TLV320AIC32X4用)
+#define AIC32X4_RESET_PIN GPIO_NUM_38
+
+// UART configuration
+#define UART_SDSP_NUM UART_NUM_1
+#define UART_KDSP_NUM UART_NUM_2
+#define UART_BUF_SIZE 1024
+#define RMT_UART_BUF_SIZE 500
+#define MIDI_BAUD_RATE 31250
+
+// Audio configuration
+#define MCLK_FREQ 12000000
+
+static esp_err_t init_i2c_and_tlv320(
+  i2c_master_bus_handle_t * i2c_bus, aic32x4_handle_t ** aic_handle)
+{
+  esp_err_t ret;
+
+  // I2Cバスの初期化
+  i2c_master_bus_config_t i2c_bus_config = {
+    .clk_source = I2C_CLK_SRC_DEFAULT,
+    .i2c_port = I2C_NUM_0,
+    .scl_io_num = I2C_SCL_PIN,
+    .sda_io_num = I2C_SDA_PIN,
+    .glitch_ignore_cnt = 7,
+    .flags.enable_internal_pullup = true,
+  };
+
+  ret = i2c_new_master_bus(&i2c_bus_config, i2c_bus);
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to create I2C bus: %s", esp_err_to_name(ret));
+    return ret;
+  }
+  ESP_LOGI(TAG, "I2C bus initialized");
+
+  // TLV320AIC32x4の初期化
+  aic32x4_config_t aic_config = {
+    .i2c_bus_handle = *i2c_bus,
+    .i2c_addr = 0x18,
+    .mclk_freq = MCLK_FREQ,
+    .sample_rate = 44100,
+    .word_length = 24,
+    .audio_format = AIC32X4_RIGHT_JUSTIFIED_MODE,
+    .master_mode = false,  // Slave mode
+    .power_cfg = AIC32X4_PWR_AIC32X4_LDO_ENABLE | AIC32X4_PWR_AVDD_DVDD_WEAK_DISABLE |
+                 AIC32X4_PWR_MICBIAS_2075_LDOIN | AIC32X4_PWR_CMMODE_LDOIN_RANGE_18_36 |
+                 AIC32X4_PWR_CMMODE_HP_LDOIN_POWERED,
+    .micpga_routing = 0,  // Default routing
+    .swap_dacs = false,
+    .reset_gpio = AIC32X4_RESET_PIN,
+  };
+
+  ret = aic32x4_init(&aic_config, aic_handle);
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to initialize TLV320AIC32x4: %s", esp_err_to_name(ret));
+    return ret;
+  }
+  ESP_LOGI(TAG, "TLV320AIC32x4 initialized");
+
+  return ESP_OK;
+}
+
+static esp_err_t init_control_midi_uart(void)
+{
+  esp_err_t ret;
+
+  // SDSP UART configuration
+  uart_config_t sdsp_uart_config = {
+    .baud_rate = MIDI_BAUD_RATE,
+    .data_bits = UART_DATA_8_BITS,
+    .parity = UART_PARITY_DISABLE,
+    .stop_bits = UART_STOP_BITS_1,
+    .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+    .source_clk = UART_SCLK_DEFAULT,
+  };
+
+  ret = uart_driver_install(UART_SDSP_NUM, UART_BUF_SIZE * 2, UART_BUF_SIZE * 2, 0, NULL, 0);
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to install SDSP UART driver: %s", esp_err_to_name(ret));
+    return ret;
+  }
+
+  ret = uart_param_config(UART_SDSP_NUM, &sdsp_uart_config);
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to configure SDSP UART: %s", esp_err_to_name(ret));
+    return ret;
+  }
+
+  ret =
+    uart_set_pin(UART_SDSP_NUM, SDSP_TX_PIN, SDSP_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to set SDSP UART pins: %s", esp_err_to_name(ret));
+    return ret;
+  }
+  ESP_LOGI(TAG, "SDSP UART initialized (TX: %d, RX: %d)", SDSP_TX_PIN, SDSP_RX_PIN);
+
+  // KDSP UART configuration
+  uart_config_t kdsp_uart_config = {
+    .baud_rate = MIDI_BAUD_RATE,
+    .data_bits = UART_DATA_8_BITS,
+    .parity = UART_PARITY_DISABLE,
+    .stop_bits = UART_STOP_BITS_1,
+    .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+    .source_clk = UART_SCLK_DEFAULT,
+  };
+
+  ret = uart_driver_install(UART_KDSP_NUM, UART_BUF_SIZE * 2, UART_BUF_SIZE * 2, 0, NULL, 0);
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to install KDSP UART driver: %s", esp_err_to_name(ret));
+    return ret;
+  }
+
+  ret = uart_param_config(UART_KDSP_NUM, &kdsp_uart_config);
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to configure KDSP UART: %s", esp_err_to_name(ret));
+    return ret;
+  }
+
+  ret =
+    uart_set_pin(UART_KDSP_NUM, KDSP_TX_PIN, KDSP_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to set KDSP UART pins: %s", esp_err_to_name(ret));
+    return ret;
+  }
+  ESP_LOGI(TAG, "KDSP UART initialized (TX: %d, RX: %d)", KDSP_TX_PIN, KDSP_RX_PIN);
+
+  return ESP_OK;
+}
+
+static esp_err_t init_sound_source_midi_rmt_uart(void)
+{
+  esp_err_t ret;
+
+  // TG1A (TX/RX)
+  rmt_uart_config_t tg1a_config = {
+    .baud_rate = MIDI_BAUD_RATE,
+    .mode = RMT_UART_MODE_TX_RX,
+    .data_bits = RMT_UART_DATA_8_BITS,
+    .parity = RMT_UART_PARITY_DISABLE,
+    .stop_bits = RMT_UART_STOP_BITS_1,
+    .tx_io_num = TG1A_TX_PIN,
+    .rx_io_num = TG1_RX_PIN,
+    .buffer_size = RMT_UART_BUF_SIZE,
+  };
+
+  ret = rmt_uart_init(RMT_UART_NUM_0, &tg1a_config);
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to initialize TG1A RMT UART: %s", esp_err_to_name(ret));
+    return ret;
+  }
+  ESP_LOGI(TAG, "TG1A RMT UART initialized (TX: %d)", TG1A_TX_PIN);
+
+  // TG1B (TX only)
+  rmt_uart_config_t tg1b_config = {
+    .baud_rate = MIDI_BAUD_RATE,
+    .mode = RMT_UART_MODE_TX_ONLY,
+    .data_bits = RMT_UART_DATA_8_BITS,
+    .parity = RMT_UART_PARITY_DISABLE,
+    .stop_bits = RMT_UART_STOP_BITS_1,
+    .tx_io_num = TG1B_TX_PIN,
+    .rx_io_num = GPIO_NUM_NC,
+    .buffer_size = RMT_UART_BUF_SIZE,
+  };
+
+  ret = rmt_uart_init(RMT_UART_NUM_1, &tg1b_config);
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to initialize TG1B RMT UART: %s", esp_err_to_name(ret));
+    return ret;
+  }
+  ESP_LOGI(TAG, "TG1B RMT UART initialized (TX: %d)", TG1B_TX_PIN);
+
+  // TG2A (TX/RX)
+  rmt_uart_config_t tg2a_config = {
+    .baud_rate = MIDI_BAUD_RATE,
+    .mode = RMT_UART_MODE_TX_RX,
+    .data_bits = RMT_UART_DATA_8_BITS,
+    .parity = RMT_UART_PARITY_DISABLE,
+    .stop_bits = RMT_UART_STOP_BITS_1,
+    .tx_io_num = TG2A_TX_PIN,
+    .rx_io_num = TG2_RX_PIN,
+    .buffer_size = RMT_UART_BUF_SIZE,
+  };
+
+  ret = rmt_uart_init(RMT_UART_NUM_2, &tg2a_config);
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to initialize TG2A RMT UART: %s", esp_err_to_name(ret));
+    return ret;
+  }
+  ESP_LOGI(TAG, "TG2A RMT UART initialized (TX: %d)", TG2A_TX_PIN);
+
+  // TG2B (TX only)
+  rmt_uart_config_t tg2b_config = {
+    .baud_rate = MIDI_BAUD_RATE,
+    .mode = RMT_UART_MODE_TX_ONLY,
+    .data_bits = RMT_UART_DATA_8_BITS,
+    .parity = RMT_UART_PARITY_DISABLE,
+    .stop_bits = RMT_UART_STOP_BITS_1,
+    .tx_io_num = TG2B_TX_PIN,
+    .rx_io_num = GPIO_NUM_NC,
+    .buffer_size = RMT_UART_BUF_SIZE,
+  };
+
+  ret = rmt_uart_init(RMT_UART_NUM_3, &tg2b_config);
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to initialize TG2B RMT UART: %s", esp_err_to_name(ret));
+    return ret;
+  }
+  ESP_LOGI(TAG, "TG2B RMT UART initialized (TX: %d)", TG2B_TX_PIN);
+
+  ESP_LOGI(TAG, "All sound source MIDI RMT UARTs initialized");
+
+  return ESP_OK;
+}
+
+void restart()
+{
+  vTaskDelay(pdMS_TO_TICKS(1000));
+  ESP_LOGI(TAG, "Restarting system...");
+  esp_restart();
+}
 
 void app_main(void)
 {
-  printf("Hello world!\n");
+  ESP_LOGI(TAG, "Starting application...");
 
-  /* Print chip information */
-  esp_chip_info_t chip_info;
-  uint32_t flash_size;
-  esp_chip_info(&chip_info);
-  printf(
-    "This is %s chip with %d CPU core(s), %s%s%s%s, ", CONFIG_IDF_TARGET, chip_info.cores,
-    (chip_info.features & CHIP_FEATURE_WIFI_BGN) ? "WiFi/" : "",
-    (chip_info.features & CHIP_FEATURE_BT) ? "BT" : "",
-    (chip_info.features & CHIP_FEATURE_BLE) ? "BLE" : "",
-    (chip_info.features & CHIP_FEATURE_IEEE802154) ? ", 802.15.4 (Zigbee/Thread)" : "");
+  i2c_master_bus_handle_t i2c_bus = NULL;
+  aic32x4_handle_t * aic_handle = NULL;
 
-  unsigned major_rev = chip_info.revision / 100;
-  unsigned minor_rev = chip_info.revision % 100;
-  printf("silicon revision v%d.%d, ", major_rev, minor_rev);
-  if (esp_flash_get_size(NULL, &flash_size) != ESP_OK) {
-    printf("Get flash size failed");
+  // 1. Initialize I2C and TLV320AIC32x4
+  if (init_i2c_and_tlv320(&i2c_bus, &aic_handle) != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to initialize I2C and TLV320AIC32x4");
+    restart();
     return;
   }
 
-  printf(
-    "%" PRIu32 "MB %s flash\n", flash_size / (uint32_t)(1024 * 1024),
-    (chip_info.features & CHIP_FEATURE_EMB_FLASH) ? "embedded" : "external");
-
-  printf("Minimum free heap size: %" PRIu32 " bytes\n", esp_get_minimum_free_heap_size());
-
-  for (int i = 10; i >= 0; i--) {
-    printf("Restarting in %d seconds...\n", i);
-    vTaskDelay(1000 / portTICK_PERIOD_MS);
+  // 2. Initialize control MIDI UARTs
+  if (init_control_midi_uart() != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to initialize control MIDI UARTs");
+    restart();
+    return;
   }
-  printf("Restarting now.\n");
-  fflush(stdout);
-  esp_restart();
+
+  // 3. Initialize sound source MIDI RMT UARTs
+  if (init_sound_source_midi_rmt_uart() != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to initialize sound source MIDI RMT UARTs");
+    restart();
+    return;
+  }
+
+  ESP_LOGI(TAG, "All peripherals initialized successfully");
+
+  unsigned char midi_msg[] = {0xF0, 0x43, 0x30, 0x31, 0x03, 0x00, 0x00,
+                              0x00, 0x00, 0x10, 0x10, 0x00, 0xF7};
+  // Test: Send a MIDI SysEx message to TG1A
+  int bytes_written = rmt_uart_write_bytes(RMT_UART_NUM_0, midi_msg, sizeof(midi_msg));
+  if (bytes_written < 0) {
+    ESP_LOGE(TAG, "Failed to send MIDI message to TG1A");
+  } else {
+    ESP_LOGI(TAG, "Sent %d bytes MIDI message to TG1A", bytes_written);
+  }
+
+  // Main loop
+  while (1) {
+    ESP_LOGI(TAG, "Running main loop...");
+    vTaskDelay(pdMS_TO_TICKS(1000));
+  }
 }
